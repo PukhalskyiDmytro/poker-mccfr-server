@@ -28,6 +28,34 @@ python -m poker_mccfr.server --host 127.0.0.1 --port 8000
 
 The server accepts one line of text per TCP connection and returns a plain-text response.
 
+## Run the example client
+
+Open a second terminal while the server is running.
+
+Health check:
+
+```bash
+python examples/plain_tcp_client.py --command HEALTH
+```
+
+Help:
+
+```bash
+python examples/plain_tcp_client.py --command HELP
+```
+
+Solve with the default example command:
+
+```bash
+python examples/plain_tcp_client.py
+```
+
+Solve with your own command:
+
+```bash
+python examples/plain_tcp_client.py --command "SOLVE board=AhKdQsJc2d oop_range=AA,AKs,AQo ip_range=QQ,AK,AQs initial_pot=100 effective_stack=300 limit_type=no-limit iterations=2000"
+```
+
 ## Protocol
 
 ### Health check
@@ -76,6 +104,14 @@ END
 ```
 
 ## Simple Python client
+
+A complete reusable example lives in:
+
+```text
+examples/plain_tcp_client.py
+```
+
+Minimal inline version:
 
 ```python
 import socket
