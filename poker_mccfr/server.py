@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import json
+import shlex
 import socket
 import threading
-from dataclasses import asdict
-from typing import Any
-from urllib.parse import urlparse
+from typing import Mapping
 
 from .cards import parse_cards
 from .game import ActionSpec, GameConfig, LimitType
-from .mccfr import MCCFRSolver
+from .mccfr import MCCFRSolver, SolveResult
 
 DEFAULT_FIRST_ACTIONS = (
     ActionSpec("check", "check"),
@@ -24,182 +22,200 @@ DEFAULT_RESPONSE_ACTIONS = (
     ActionSpec("raise_100", "raise", 1.0),
 )
 
+HELP_TEXT = """OK
+Poker MCCFR local TCP protocol
 
-class BadRequest(ValueError):
+Commands:
+  HEALTH
+  HELP
+  SOLVE board=<cards> oop_range=<range> ip_range=<range> [initial_pot=<float>] [effective_stack=<float>] [limit_type=no-limit|pot-limit] [iterations=<int>] [seed=<int|none>]
+
+Optional action abstractions:
+  first_actions=check:check,bet_25:bet:0.25,bet_100:bet:1.0
+  response_actions=fold:fold,call:call,raise_50:raise:0.5,raise_100:raise:1.0
+
+Example:
+  SOLVE board=AhKdQsJc2d oop_range=AA,AKs,AQo ip_range=QQ,AK,AQs initial_pot=100 effective_stack=300 limit_type=no-limit iterations=2000
+END
+"""
+
+
+class ProtocolError(ValueError):
     pass
 
 
-def _json_default(value: Any) -> Any:
-    if isinstance(value, LimitType):
-        return value.value
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+def parse_command(line: str) -> tuple[str, dict[str, str]]:
+    """Parse a one-line plain-text command.
+
+    Format:
+        COMMAND key=value key=value
+
+    This is intentionally not HTTP and not JSON. It is a small local protocol
+    for sending commands over a raw TCP socket.
+    """
+    try:
+        parts = shlex.split(line.strip())
+    except ValueError as exc:
+        raise ProtocolError(f"cannot parse command: {exc}") from exc
+
+    if not parts:
+        raise ProtocolError("empty command")
+
+    command = parts[0].upper()
+    params: dict[str, str] = {}
+    for token in parts[1:]:
+        if "=" not in token:
+            raise ProtocolError(f"expected key=value token, got {token!r}")
+        key, value = token.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if not key:
+            raise ProtocolError("empty parameter name")
+        params[key] = value
+    return command, params
 
 
-def action_from_payload(payload: dict[str, Any]) -> ActionSpec:
-    if not isinstance(payload, dict):
-        raise BadRequest("action must be an object")
-    code = payload.get("code")
-    kind = payload.get("kind")
-    fraction = payload.get("fraction")
-    if not isinstance(code, str) or not code:
-        raise BadRequest("action.code must be a non-empty string")
+def _positive_float(params: Mapping[str, str], key: str, default: float) -> float:
+    raw = params.get(key, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ProtocolError(f"{key} must be numeric") from exc
+    if value <= 0:
+        raise ProtocolError(f"{key} must be positive")
+    return value
+
+
+def _positive_int(params: Mapping[str, str], key: str, default: int) -> int:
+    raw = params.get(key, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ProtocolError(f"{key} must be an integer") from exc
+    if value <= 0:
+        raise ProtocolError(f"{key} must be positive")
+    return value
+
+
+def action_from_text(text: str) -> ActionSpec:
+    """Parse one action token: code:kind or code:kind:fraction."""
+    parts = text.split(":")
+    if len(parts) not in {2, 3}:
+        raise ProtocolError(f"invalid action {text!r}; expected code:kind or code:kind:fraction")
+
+    code, kind = parts[0].strip(), parts[1].strip()
+    if not code:
+        raise ProtocolError("action code cannot be empty")
     if kind not in {"check", "bet", "fold", "call", "raise"}:
-        raise BadRequest("action.kind must be one of check, bet, fold, call, raise")
-    if fraction is not None:
+        raise ProtocolError("action kind must be one of check, bet, fold, call, raise")
+
+    fraction: float | None = None
+    if len(parts) == 3:
         try:
-            fraction = float(fraction)
-        except (TypeError, ValueError) as exc:
-            raise BadRequest("action.fraction must be numeric or null") from exc
+            fraction = float(parts[2])
+        except ValueError as exc:
+            raise ProtocolError(f"action fraction must be numeric in {text!r}") from exc
         if fraction < 0:
-            raise BadRequest("action.fraction cannot be negative")
+            raise ProtocolError("action fraction cannot be negative")
+
     return ActionSpec(code=code, kind=kind, fraction=fraction)
 
 
-def _actions_from_payload(payload: Any, default: tuple[ActionSpec, ...]) -> tuple[ActionSpec, ...]:
-    if payload is None:
+def actions_from_text(text: str | None, default: tuple[ActionSpec, ...]) -> tuple[ActionSpec, ...]:
+    if text is None or text == "":
         return default
-    if not isinstance(payload, list) or not payload:
-        raise BadRequest("actions must be a non-empty list")
-    return tuple(action_from_payload(item) for item in payload)
+    actions = tuple(action_from_text(item.strip()) for item in text.split(",") if item.strip())
+    if not actions:
+        raise ProtocolError("actions list cannot be empty")
+    return actions
 
 
-def _positive_float(payload: dict[str, Any], key: str, default: float) -> float:
-    value = payload.get(key, default)
+def build_config(params: Mapping[str, str]) -> GameConfig:
+    raw_limit = params.get("limit_type", LimitType.NO_LIMIT.value)
     try:
-        value = float(value)
-    except (TypeError, ValueError) as exc:
-        raise BadRequest(f"{key} must be numeric") from exc
-    if value <= 0:
-        raise BadRequest(f"{key} must be positive")
-    return value
-
-
-def _positive_int(payload: dict[str, Any], key: str, default: int) -> int:
-    value = payload.get(key, default)
-    try:
-        value = int(value)
-    except (TypeError, ValueError) as exc:
-        raise BadRequest(f"{key} must be an integer") from exc
-    if value <= 0:
-        raise BadRequest(f"{key} must be positive")
-    return value
-
-
-def build_config(payload: dict[str, Any]) -> GameConfig:
-    limit_raw = payload.get("limit_type", LimitType.NO_LIMIT.value)
-    try:
-        limit_type = LimitType(limit_raw)
+        limit_type = LimitType(raw_limit)
     except ValueError as exc:
-        raise BadRequest("limit_type must be 'no-limit' or 'pot-limit'") from exc
+        raise ProtocolError("limit_type must be no-limit or pot-limit") from exc
 
     return GameConfig(
-        initial_pot=_positive_float(payload, "initial_pot", 100.0),
-        effective_stack=_positive_float(payload, "effective_stack", 300.0),
+        initial_pot=_positive_float(params, "initial_pot", 100.0),
+        effective_stack=_positive_float(params, "effective_stack", 300.0),
         limit_type=limit_type,
-        first_actions=_actions_from_payload(payload.get("first_actions"), DEFAULT_FIRST_ACTIONS),
-        response_actions=_actions_from_payload(payload.get("response_actions"), DEFAULT_RESPONSE_ACTIONS),
-        max_raises_per_round=_positive_int(payload, "max_raises_per_round", 2),
+        first_actions=actions_from_text(params.get("first_actions"), DEFAULT_FIRST_ACTIONS),
+        response_actions=actions_from_text(params.get("response_actions"), DEFAULT_RESPONSE_ACTIONS),
+        max_raises_per_round=_positive_int(params, "max_raises_per_round", 2),
     )
 
 
-def solve_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise BadRequest("request body must be a JSON object")
+def solve_params(params: Mapping[str, str]) -> SolveResult:
+    board = params.get("board")
+    oop_range = params.get("oop_range")
+    ip_range = params.get("ip_range")
 
-    board = payload.get("board")
-    oop_range = payload.get("oop_range")
-    ip_range = payload.get("ip_range")
-    if not isinstance(board, str) or not board:
-        raise BadRequest("board must be a non-empty string")
-    if not isinstance(oop_range, str) or not oop_range:
-        raise BadRequest("oop_range must be a non-empty string")
-    if not isinstance(ip_range, str) or not ip_range:
-        raise BadRequest("ip_range must be a non-empty string")
+    if not board:
+        raise ProtocolError("missing required parameter board")
+    if not oop_range:
+        raise ProtocolError("missing required parameter oop_range")
+    if not ip_range:
+        raise ProtocolError("missing required parameter ip_range")
 
-    iterations = _positive_int(payload, "iterations", 1000)
+    iterations = _positive_int(params, "iterations", 1000)
     if iterations > 200_000:
-        raise BadRequest("iterations cannot exceed 200000")
+        raise ProtocolError("iterations cannot exceed 200000")
 
-    seed = payload.get("seed", 7)
-    if seed is not None:
+    raw_seed = params.get("seed", "7")
+    if raw_seed.lower() in {"none", "null", "random"}:
+        seed: int | None = None
+    else:
         try:
-            seed = int(seed)
-        except (TypeError, ValueError) as exc:
-            raise BadRequest("seed must be an integer or null") from exc
+            seed = int(raw_seed)
+        except ValueError as exc:
+            raise ProtocolError("seed must be an integer or none") from exc
 
-    config = build_config(payload)
-    solver = MCCFRSolver(config, parse_cards(board), oop_range, ip_range, seed)
-    result = solver.train(iterations)
-    return asdict(result)
+    solver = MCCFRSolver(build_config(params), parse_cards(board), oop_range, ip_range, seed)
+    return solver.train(iterations)
 
 
-def json_response(status_code: int, payload: dict[str, Any]) -> bytes:
-    reason = {
-        200: "OK",
-        400: "Bad Request",
-        404: "Not Found",
-        405: "Method Not Allowed",
-        500: "Internal Server Error",
-    }.get(status_code, "OK")
-    body = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=_json_default).encode("utf-8")
-    headers = [
-        f"HTTP/1.1 {status_code} {reason}",
-        "Content-Type: application/json; charset=utf-8",
-        f"Content-Length: {len(body)}",
-        "Connection: close",
-        "",
-        "",
+def format_result(result: SolveResult) -> str:
+    lines = [
+        "OK",
+        f"iterations={result.iterations}",
+        f"ev_oop={result.ev_oop:.10f}",
+        f"ev_ip={result.ev_ip:.10f}",
+        f"exploitability={result.exploitability:.10f}",
+        f"infosets={result.infosets}",
+        "strategies:",
     ]
-    return "\r\n".join(headers).encode("ascii") + body
+
+    for infoset_key, probabilities in result.strategies.items():
+        action_text = " ".join(f"{action}={probability:.10f}" for action, probability in probabilities.items())
+        lines.append(f"{infoset_key} {action_text}")
+
+    lines.append("END")
+    return "\n".join(lines) + "\n"
 
 
-def parse_http_request(raw: bytes) -> tuple[str, str, dict[str, str], bytes]:
+def handle_command(line: str) -> str:
     try:
-        header_bytes, body = raw.split(b"\r\n\r\n", 1)
-        header_text = header_bytes.decode("iso-8859-1")
-    except ValueError as exc:
-        raise BadRequest("malformed HTTP request") from exc
-
-    lines = header_text.split("\r\n")
-    try:
-        method, target, _version = lines[0].split(" ", 2)
-    except ValueError as exc:
-        raise BadRequest("malformed request line") from exc
-
-    headers: dict[str, str] = {}
-    for line in lines[1:]:
-        if not line:
-            continue
-        if ":" not in line:
-            raise BadRequest("malformed header")
-        name, value = line.split(":", 1)
-        headers[name.strip().lower()] = value.strip()
-    return method.upper(), urlparse(target).path, headers, body
-
-
-def handle_http_request(raw: bytes) -> bytes:
-    try:
-        method, path, _headers, body = parse_http_request(raw)
-        if method == "GET" and path == "/health":
-            return json_response(200, {"status": "ok"})
-        if method == "GET" and path == "/":
-            return json_response(200, {"name": "poker-mccfr-server", "endpoints": ["GET /health", "POST /solve"]})
-        if path == "/solve" and method != "POST":
-            return json_response(405, {"error": "method not allowed"})
-        if method == "POST" and path == "/solve":
-            try:
-                payload = json.loads(body.decode("utf-8") if body else "{}")
-            except json.JSONDecodeError as exc:
-                raise BadRequest("request body must be valid JSON") from exc
-            return json_response(200, solve_payload(payload))
-        return json_response(404, {"error": "not found"})
-    except BadRequest as exc:
-        return json_response(400, {"error": str(exc)})
+        command, params = parse_command(line)
+        if command == "HEALTH":
+            if params:
+                raise ProtocolError("HEALTH does not accept parameters")
+            return "OK status=ok\n"
+        if command == "HELP":
+            return HELP_TEXT
+        if command == "SOLVE":
+            return format_result(solve_params(params))
+        raise ProtocolError(f"unknown command {command!r}; use HELP")
+    except ProtocolError as exc:
+        return f"ERROR {exc}\n"
     except Exception as exc:  # pragma: no cover - defensive server boundary
-        return json_response(500, {"error": str(exc)})
+        return f"ERROR internal error: {exc}\n"
 
 
 class PokerSocketServer:
+    """Small local TCP server for the plain-text poker protocol."""
+
     def __init__(self, host: str = "127.0.0.1", port: int = 8000, backlog: int = 16):
         self.host = host
         self.port = port
@@ -221,7 +237,7 @@ class PokerSocketServer:
             server_socket.listen(self.backlog)
             server_socket.settimeout(0.25)
             self._socket = server_socket
-            print(f"Poker MCCFR socket server listening on http://{self.address[0]}:{self.address[1]}", flush=True)
+            print(f"Poker MCCFR TCP server listening on {self.address[0]}:{self.address[1]}", flush=True)
 
             while not self._stop_event.is_set():
                 try:
@@ -243,44 +259,28 @@ class PokerSocketServer:
     def _handle_client(self, client_socket: socket.socket) -> None:
         with client_socket:
             try:
-                request = self._read_request(client_socket)
-                response = handle_http_request(request)
-                client_socket.sendall(response)
+                request = self._read_line(client_socket)
+                response = handle_command(request.decode("utf-8", errors="replace"))
+                client_socket.sendall(response.encode("utf-8"))
             except OSError:
                 return
 
     @staticmethod
-    def _read_request(client_socket: socket.socket) -> bytes:
+    def _read_line(client_socket: socket.socket) -> bytes:
         client_socket.settimeout(5.0)
         data = b""
-        while b"\r\n\r\n" not in data:
+        while b"\n" not in data:
             chunk = client_socket.recv(4096)
             if not chunk:
                 break
             data += chunk
             if len(data) > 2_000_000:
-                raise BadRequest("request too large")
-
-        if b"\r\n\r\n" not in data:
-            return data
-
-        headers, body = data.split(b"\r\n\r\n", 1)
-        content_length = 0
-        for line in headers.decode("iso-8859-1").split("\r\n")[1:]:
-            if line.lower().startswith("content-length:"):
-                content_length = int(line.split(":", 1)[1].strip())
-                break
-
-        while len(body) < content_length:
-            chunk = client_socket.recv(min(4096, content_length - len(body)))
-            if not chunk:
-                break
-            body += chunk
-        return headers + b"\r\n\r\n" + body
+                raise ProtocolError("request too large")
+        return data.split(b"\n", 1)[0].rstrip(b"\r")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the local socket-based Poker MCCFR server.")
+    parser = argparse.ArgumentParser(description="Run the local plain TCP Poker MCCFR server.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
