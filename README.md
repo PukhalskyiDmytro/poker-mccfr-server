@@ -4,8 +4,6 @@ Local socket-based HTTP server that models a two-player poker betting abstractio
 
 The implementation focuses on river/all-known-board subgames. It supports OOP/IP positions, configurable initial pot and stacks, no-limit or pot-limit sizing caps, separate first-action and response-action abstractions, hand ranges, EV calculation, and a best-response based exploitability estimate.
 
-This version intentionally does **not** use FastAPI, Uvicorn, Pydantic, Flask, or any web framework. The server is implemented directly on top of Python's standard-library `socket` module.
-
 ## Install
 
 ```bash
