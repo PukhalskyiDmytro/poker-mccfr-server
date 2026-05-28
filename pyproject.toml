@@ -1,0 +1,16 @@
+[project]
+name = "poker-mccfr-server"
+version = "0.2.0"
+description = "Socket-based local server for a two-player poker MCCFR betting abstraction"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
